@@ -267,123 +267,210 @@ router.post('/Vaccines_booking', async (req, res) => {
 
 
 
-// ✅ تعديل الحجز باستخدام اسم المريض  
-router.patch('/Vaccines_booking/name/:name', async (req, res) => {
+router.patch('/Vaccines_booking/:id', async (req, res) => {
   try {
-    const { name } = req.params;
+    const id = parseInt(req.params.id, 10);
+    if (!id) {
+      return res.status(400).json({
+        success: false,
+        error: 'Valid vaccination ID is required'
+      });
+    }
+
     const fields = req.body;
+    if (!fields || Object.keys(fields).length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No data provided for update'
+      });
+    }
 
     const pool = await sql.connect(dbConfig);
 
-    // ✅ الحصول على الحجز الحالي حسب اسم المريض
-    const bookingResult = await pool.request()
-      .input('name', sql.NVarChar, name)
-      .query(`SELECT * FROM Vaccines_booking WHERE patient_name = @name`);
+    // ✅ التحقق من وجود الحجز
+    const bookingRes = await pool.request()
+      .input('id', sql.Int, id)
+      .query('SELECT * FROM Vaccines_booking WHERE vaccination_id = @id');
 
-    if (bookingResult.recordset.length === 0) {
-      return res.status(404).json({ error: 'No booking found for this patient name.' });
+    if (bookingRes.recordset.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Booking not found'
+      });
     }
 
-    const booking = bookingResult.recordset[0];
-    const bookingId = booking.id;
-
-    // ✅ تحقق من التعارض إذا كان التاريخ والوقت واللقاح موجودين
+    // ✅ التحقق من التعارض
     if (fields.appointment_date && fields.appointment_time && fields.Vaccines_name) {
-      const timeObj = new Date(`1970-01-01T${fields.appointment_time}`);
-
-      const duplicate = await pool.request()
-        .input('appointment_date', sql.Date, fields.appointment_date)
-        .input('appointment_time', sql.Time, timeObj)
-        .input('Vaccines_name', sql.NVarChar, fields.Vaccines_name)
-        .input('id', sql.Int, bookingId)
-        .query(`SELECT * FROM Vaccines_booking
-                WHERE appointment_date = @appointment_date
-                AND appointment_time = @appointment_time
-                AND Vaccines_name = @Vaccines_name
-                AND id != @id`);
-
-      if (duplicate.recordset.length > 0) {
-        return res.status(409).json({ error: 'Duplicate booking for the same vaccine at the same time and date.' });
+      const sqlTime = toSqlTime(fields.appointment_time);
+      if (!sqlTime) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid time format. Use HH:mm or HH:mm AM/PM'
+        });
       }
 
-      fields.appointment_time = timeObj;
+      const dup = await pool.request()
+        .input('appointment_date', sql.Date, fields.appointment_date)
+        .input('appointment_time', sql.VarChar(8), sqlTime)
+        .input('Vaccines_name', sql.NVarChar, fields.Vaccines_name)
+        .input('id', sql.Int, id)
+        .query(`
+          SELECT 1 FROM Vaccines_booking
+          WHERE appointment_date = @appointment_date
+            AND appointment_time = @appointment_time
+            AND Vaccines_name = @Vaccines_name
+            AND vaccination_id <> @id
+        `);
+
+      if (dup.recordset.length > 0) {
+        return res.status(409).json({
+          success: false,
+          error: 'Duplicate booking for the same vaccine at the same time and date'
+        });
+      }
+
+      fields.appointment_time = sqlTime;
     }
 
-    // ✅ بناء الاستعلام الديناميكي للتحديث
-    const updates = [];
+    // ✅ بناء استعلام التحديث
     const request = pool.request();
-    request.input('id', sql.Int, bookingId);
+    request.input('id', sql.Int, id);
+    const updates = [];
 
     for (const key in fields) {
-      if (fields[key] !== undefined) {
-        let value = fields[key];
+      if (fields[key] === undefined) continue;
 
-        switch (key) {
-          case 'appointment_date':
-          case 'birth_date':
-            request.input(key, sql.Date, value);
-            break;
-          case 'appointment_time':
-            request.input(key, sql.Time, value);
-            break;
-          case 'Distance':
-            request.input(key, sql.Float, value);
-            break;
-          case 'patient_phone':
-          case 'national_id':
-          case 'Gender':
-            request.input(key, sql.VarChar, value);
-            break;
-          default:
-            request.input(key, sql.NVarChar, value);
-        }
-
-        updates.push(`${key} = @${key}`);
+      switch (key) {
+        case 'appointment_date':
+        case 'birth_date':
+          request.input(key, sql.Date, fields[key]);
+          break;
+        case 'appointment_time':
+          request.input(key, sql.VarChar(8), toSqlTime(fields[key]));
+          break;
+        case 'Distance':
+          request.input(key, sql.Float, fields[key]);
+          break;
+        case 'patient_phone':
+        case 'national_id':
+        case 'Gender':
+          request.input(key, sql.VarChar, fields[key]);
+          break;
+        default:
+          request.input(key, sql.NVarChar, fields[key]);
       }
+
+      updates.push(`${key} = @${key}`);
     }
 
     if (updates.length === 0) {
-      return res.status(400).json({ error: 'No valid fields provided for update.' });
+      return res.status(400).json({
+        success: false,
+        error: 'No valid fields provided for update'
+      });
     }
 
-    const query = `UPDATE Vaccines_booking SET ${updates.join(', ')} WHERE id = @id`;
+    const updateQuery = `
+      UPDATE Vaccines_booking
+      SET ${updates.join(', ')}
+      WHERE vaccination_id = @id
+    `;
 
-    await request.query(query);
+    await request.query(updateQuery);
 
-    res.status(200).json({ message: 'Booking updated successfully.' });
+    return res.status(200).json({
+      success: true,
+      message: 'Booking updated successfully'
+    });
+
   } catch (error) {
-    console.error('Patch Booking By Name Error:', error);
-    res.status(500).json({ error: 'Error updating booking.' });
+    console.error('Update vaccine booking error:', error);
+    if (error.originalError?.info?.message) {
+      console.error('SQL Message:', error.originalError.info.message);
+    }
+
+    return res.status(500).json({
+      success: false,
+      error: 'Internal server error'
+    });
   }
+
+
+/* 🔧 تحويل الوقت إلى HH:mm:ss */
+function toSqlTime(input = '') {
+  const t = input.trim().toUpperCase();
+
+  if (/^\d{1,2}:\d{2}:\d{2}$/.test(t)) {
+    const [h, m, s] = t.split(':');
+    return `${h.padStart(2, '0')}:${m}:${s}`;
+  }
+
+  if (/^\d{1,2}:\d{2}$/.test(t)) {
+    const [h, m] = t.split(':');
+    return `${h.padStart(2, '0')}:${m}:00`;
+  }
+
+  if (/^\d{1,2}:\d{2}(:\d{2})?\s?(AM|PM)$/.test(t)) {
+    const d = new Date(`1970-01-01 ${t}`);
+    return isNaN(d) ? null : d.toTimeString().slice(0, 8);
+  }
+
+  return null;
+}
 });
 
 
-// ✅ حذف حجز باستخدام اسم المريض
-router.delete('/Vaccines_booking/name/:name', async (req, res) => {
+router.delete('/Vaccines_booking/:id', async (req, res) => {
   try {
-    const { name } = req.params;
+    /* -------------------- 🆔 استخراج المعرّف -------------------- */
+    const id = parseInt(req.params.id, 10);
+    if (!id) {
+      return res.status(400).json({
+        success: false,
+        error: 'Valid vaccination ID is required'
+      });
+    }
+
+    /* ---------------- 🔗 الاتصال بقاعدة البيانات ---------------- */
     const pool = await sql.connect(dbConfig);
 
-    // أولاً، تأكد من وجود الحجز
-    const result = await pool.request()
-      .input('name', sql.NVarChar, name)
-      .query('SELECT * FROM Vaccines_booking WHERE patient_name = @name');
+    /* --------- 🧐 التحقق من وجود الحجز قبل الحذف --------- */
+    const check = await pool.request()
+      .input('id', sql.Int, id)
+      .query('SELECT 1 FROM Vaccines_booking WHERE vaccination_id = @id');
 
-    if (result.recordset.length === 0) {
-      return res.status(404).json({ error: 'No booking found with this patient name.' });
+    if (check.recordset.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Booking not found'
+      });
     }
 
-    // حذف كل الحجوزات بنفس الاسم (أو يمكنك تحديد شرط إضافي إذا الاسم مكرر)
+    /* -------------------- 🗑 تنفيذ الحذف -------------------- */
     await pool.request()
-      .input('name', sql.NVarChar, name)
-      .query('DELETE FROM Vaccines_booking WHERE patient_name = @name');
+      .input('id', sql.Int, id)
+      .query('DELETE FROM Vaccines_booking WHERE vaccination_id = @id');
 
-    res.status(200).json({ message: 'Booking(s) deleted successfully.' });
+    /* ---------------- ✅ استجابة النجاح ---------------- */
+    return res.status(200).json({
+      success: true,
+      message: 'Booking deleted successfully'
+    });
+
   } catch (error) {
-    console.error('Delete Booking By Name Error:', error);
-    res.status(500).json({ error: 'Error deleting booking.' });
-  }
+    /* --------------- 🔴 طباعة الخطأ للتشخيص --------------- */
+    console.error('Delete vaccine booking error:', error);
+    if (error.originalError?.info?.message) {
+      console.error('SQL Message:', error.originalError.info.message);
+    }
+
+    return res.status(500).json({
+      success: false,
+      error: 'Internal server error'
+    });
+  }
 });
+
 
 
 // في ملف routes/booking.js
